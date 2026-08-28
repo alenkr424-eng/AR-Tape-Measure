@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "com.unity.mobile.android-logcat": "1.4.7",
+    "com.unity.xr.arcore": "6.0.8",
+    "com.unity.xr.arfoundation": "6.0.8",
+    "com.unity.modules.imageconversion": "1.0.0"
+  }
+}
