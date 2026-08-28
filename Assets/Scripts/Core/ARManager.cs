@@ -539,6 +539,15 @@ namespace SmartARMeasure.Core
                     PlaneDetectionMode.Vertical;
 
                 planeManager.enabled = true;
+
+                if (planeManager.planePrefab == null)
+                {
+                    GameObject template = new GameObject("ARPlaneTemplate", typeof(ARPlane), typeof(ARPlaneMeshVisualizer), typeof(MeshFilter), typeof(MeshRenderer), typeof(SmartARMeasure.Visuals.PlaneVisualizer));
+                    template.transform.SetParent(transform);
+                    template.SetActive(false);
+                    planeManager.planePrefab = template;
+                    Debug.Log("[ARManager] Successfully initialized ARPlaneManager planePrefab template.");
+                }
             }
             else
             {

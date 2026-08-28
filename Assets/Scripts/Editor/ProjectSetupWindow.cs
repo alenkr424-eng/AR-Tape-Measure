@@ -62,6 +62,11 @@ namespace SmartARMeasure.EditorTools
             ARPlaneManager planeMgr = xrOriginObj.GetComponent<ARPlaneManager>();
             planeMgr.requestedDetectionMode = UnityEngine.XR.ARSubsystems.PlaneDetectionMode.Horizontal | UnityEngine.XR.ARSubsystems.PlaneDetectionMode.Vertical;
 
+            GameObject planePrefabObj = new GameObject("ARPlanePrefab", typeof(ARPlane), typeof(ARPlaneMeshVisualizer), typeof(MeshFilter), typeof(MeshRenderer), typeof(Visuals.PlaneVisualizer));
+            planePrefabObj.transform.SetParent(xrOriginObj.transform);
+            planePrefabObj.SetActive(false);
+            planeMgr.planePrefab = planePrefabObj;
+
             Add<Core.ARManager>(arRoot, "ARManager");
 
             // ---- 3. UI CANVAS SYSTEM ----
