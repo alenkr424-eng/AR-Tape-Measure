@@ -72,13 +72,11 @@ namespace SmartARMeasure.UI
                     {
                         AudioFeedback.PlayClick();
                         HapticFeedback.TriggerMedium();
-                        string path = ExportUtility.ExportToCSV(MeasurementManager.Instance.HistoryRecords);
-                        ExportUtility.ShareFileNative(path, "text/csv", "Share AR Measurements CSV");
-                        NotificationToastController.Instance?.ShowToast("CSV exported & ready to share");
+                        ExportUtility.ExportToCSVSAF(MeasurementManager.Instance.HistoryRecords);
                     }
                     else
                     {
-                        NotificationToastController.Instance?.ShowToast("No history entries to export");
+                        NotificationToastController.Instance?.ShowToast("No measurements to export.");
                     }
                 });
             }

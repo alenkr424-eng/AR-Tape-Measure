@@ -13,6 +13,8 @@ namespace SmartARMeasure.UI
     /// </summary>
     public class AROverlayUIController : MonoBehaviour
     {
+        public static AROverlayUIController Instance { get; private set; }
+
         [Header("Top Toolbar Buttons")]
         [SerializeField] private Button homeButton;
         [SerializeField] private Button resetButton;
@@ -47,6 +49,16 @@ namespace SmartARMeasure.UI
 
         private void Awake()
         {
+            if (Instance == null)
+            {
+                Instance = this;
+            }
+            else if (Instance != this)
+            {
+                Destroy(gameObject);
+                return;
+            }
+
             SetupUnitLabelButton();
             BindTopToolbar();
             BindBottomToolbar();
@@ -404,6 +416,35 @@ namespace SmartARMeasure.UI
             if (trackingHintBanner != null && ARManager.Instance != null && ARManager.Instance.CurrentState == ARTrackingState.TrackingActive)
             {
                 trackingHintBanner.SetActive(false);
+            }
+        }
+
+        public void ShowCustomHint(string text, float duration = 3.5f)
+        {
+            if (trackingHintBanner == null || trackingHintText == null) return;
+            
+            CancelInvoke(nameof(HideCustomHint));
+            CancelInvoke(nameof(HideTrackingHint));
+
+            trackingHintBanner.SetActive(true);
+            trackingHintText.text = text;
+            
+            if (duration > 0f)
+            {
+                Invoke(nameof(HideCustomHint), duration);
+            }
+        }
+
+        private void HideCustomHint()
+        {
+            if (trackingHintBanner != null)
+            {
+                trackingHintBanner.SetActive(false);
+            }
+            // Restore AR tracking state if needed
+            if (ARManager.Instance != null)
+            {
+                UpdateTrackingStatusHint(ARManager.Instance.CurrentState);
             }
         }
 

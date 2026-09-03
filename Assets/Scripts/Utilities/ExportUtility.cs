@@ -3,16 +3,123 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using SmartARMeasure.Models;
+using SmartARMeasure.UI;
 using UnityEngine;
 
 namespace SmartARMeasure.Utilities
 {
+    public class ExportCallbackReceiver : MonoBehaviour
+    {
+        public void OnExportSuccess(string message)
+        {
+            NotificationToastController.Instance?.ShowToast("CSV exported successfully!");
+            Destroy(gameObject);
+        }
+
+        public void OnExportFailure(string error)
+        {
+            NotificationToastController.Instance?.ShowToast("Unable to export CSV.");
+            Destroy(gameObject);
+        }
+
+        public void OnExportCancel(string message)
+        {
+            Destroy(gameObject);
+        }
+    }
+
     /// <summary>
     /// Export utility for generating CSV reports, formatted PDF/TXT measurement summaries, and sharing via Android native intents.
     /// </summary>
     public static class ExportUtility
     {
         private const string EXPORT_DIR_NAME = "SmartARExports";
+
+        private static string EscapeCSV(string str)
+        {
+            if (string.IsNullOrEmpty(str)) return "";
+            if (str.Contains(",") || str.Contains("\"") || str.Contains("\n") || str.Contains("\r"))
+            {
+                return $"\"{str.Replace("\"", "\"\"")}\"";
+            }
+            return str;
+        }
+
+        /// <summary>
+        /// Exports measurement records to a CSV file using Android's Storage Access Framework.
+        /// </summary>
+        public static void ExportToCSVSAF(List<MeasurementRecord> records)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("Date,Time,Mode,Measurement,Unit");
+
+            foreach (var record in records)
+            {
+                double raw = record.totalDistanceMeters;
+                string valStr = "";
+                string unitStr = "";
+                
+                if (record.modeUsed == MeasurementMode.Area)
+                {
+                    if (record.unitUsed == MeasurementUnit.Metric)
+                    {
+                        valStr = raw.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
+                        unitStr = "m²";
+                    }
+                    else
+                    {
+                        valStr = (raw * UnitConverter.SQM_TO_SQFT_D).ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
+                        unitStr = "ft²";
+                    }
+                }
+                else
+                {
+                    if (record.unitUsed == MeasurementUnit.Metric)
+                    {
+                        valStr = raw.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
+                        unitStr = "m";
+                    }
+                    else
+                    {
+                        valStr = (raw * UnitConverter.METERS_TO_FEET_D).ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
+                        unitStr = "ft";
+                    }
+                }
+                
+                string dateStr = EscapeCSV(record.dateString);
+                string timeStr = EscapeCSV(record.timeString);
+                string modeStr = EscapeCSV(record.modeUsed.ToString());
+                string unitEscaped = EscapeCSV(unitStr);
+                
+                sb.AppendLine($"{dateStr},{timeStr},{modeStr},{valStr},{unitEscaped}");
+            }
+
+            string csvContent = sb.ToString();
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+            GameObject callbackObj = new GameObject("ExportCallbackReceiver");
+            callbackObj.AddComponent<ExportCallbackReceiver>();
+
+            try
+            {
+                using (AndroidJavaClass jc = new AndroidJavaClass("com.smartar.export.FileExportFragment"))
+                {
+                    jc.CallStatic("exportCSV", csvContent, "SmartARMeasure_Logs.csv", callbackObj.name, "OnExportSuccess", "OnExportFailure", "OnExportCancel");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("Failed to call exportCSV Java plugin: " + ex.Message);
+                UnityEngine.Object.Destroy(callbackObj);
+                NotificationToastController.Instance?.ShowToast("Unable to export CSV.");
+            }
+#else
+            // Fallback for editor or other platforms
+            string path = ExportToCSV(records);
+            Debug.Log($"[Editor] Exported to: {path}");
+            NotificationToastController.Instance?.ShowToast("CSV exported successfully!");
+#endif
+        }
 
         /// <summary>
         /// Exports all measurement records to a CSV file.

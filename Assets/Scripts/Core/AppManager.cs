@@ -62,11 +62,13 @@ namespace SmartARMeasure.Core
                 {
                     PermissionHandler.Instance.RequestCameraPermission();
                 }
-
-                // Explicitly activate AR Camera, AR Camera Background, and AR Session
-                if (ARManager.Instance != null)
+                else
                 {
-                    ARManager.Instance.EnsureARCameraActive();
+                    // Explicitly activate AR Camera, AR Camera Background, and AR Session
+                    if (ARManager.Instance != null)
+                    {
+                        ARManager.Instance.EnsureARCameraActive();
+                    }
                 }
 
                 Debug.Log("Entering AR Measurement Mode - Live Camera & AR Session Active");

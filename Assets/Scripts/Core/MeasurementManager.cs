@@ -112,9 +112,9 @@ namespace SmartARMeasure.Core
         private Color markerColor =
             new Color(0.0f, 1.0f, 1.0f, 1.0f);
 
-        // ~2.2 cm diameter sphere (reduced by ~18% from 2.7cm)
+        // ~1.5 cm diameter sphere (calibrated centralized marker scale)
         [SerializeField]
-        private float markerSize = 0.022f;
+        private float markerSize = 0.015f;
 
         [SerializeField]
         private Color lineColor =
@@ -344,10 +344,39 @@ namespace SmartARMeasure.Core
 
         private void Update()
         {
-            if (!enableTouchMeasurement)
-                return;
+            // MeasurementManager no longer polls Input directly.
+            // All input is routed from ARManager's gesture state machine.
+        }
 
-            HandleTouchInput();
+        private void LateUpdate()
+        {
+            SyncPointsWithAnchors();
+        }
+
+        private void SyncPointsWithAnchors()
+        {
+            if (markers.Count == 0 || measurementPoints.Count == 0) return;
+
+            bool updated = false;
+            int count = Mathf.Min(markers.Count, measurementPoints.Count);
+            for (int i = 0; i < count; i++)
+            {
+                if (markers[i] != null)
+                {
+                    Vector3 currentAnchorPos = markers[i].transform.position;
+                    if (Vector3.SqrMagnitude(currentAnchorPos - measurementPoints[i]) > 1e-6f)
+                    {
+                        measurementPoints[i] = currentAnchorPos;
+                        updated = true;
+                    }
+                }
+            }
+
+            if (updated && measurementPoints.Count >= 2)
+            {
+                UpdateMeasurementVisuals();
+                CalculateMeasurement();
+            }
         }
 
         // =========================================================
@@ -400,44 +429,169 @@ namespace SmartARMeasure.Core
         }
 
         // =========================================================
-        // TOUCH INPUT
+        // DRAG API
         // =========================================================
 
-        private void HandleTouchInput()
+        public bool GetMarkerAtScreenPoint(Vector2 screenPoint, out int markerIndex)
         {
-            if (Input.touchCount <= 0)
-                return;
+            markerIndex = -1;
+            if (ARManager.Instance == null || ARManager.Instance.ARCamera == null) return false;
+            Camera cam = ARManager.Instance.ARCamera;
+            
+            float minSqrDist = float.MaxValue;
+            float maxRadius = 150f; // Reasonable hit radius
+            float maxSqrRadius = maxRadius * maxRadius;
 
-            Touch touch =
-                Input.GetTouch(0);
-
-            if (touch.phase != TouchPhase.Began)
-                return;
-
-            if (Time.unscaledTime - lastTapTime <
-                tapCooldown)
+            for (int i = 0; i < markers.Count; i++)
             {
-                return;
+                if (markers[i] == null || !markers[i].activeInHierarchy) continue;
+                Vector3 screenPos = cam.WorldToScreenPoint(markers[i].transform.position);
+                if (screenPos.z < 0) continue; // Behind camera
+
+                Vector2 screenPos2D = new Vector2(screenPos.x, screenPos.y);
+                float sqrDist = (screenPos2D - screenPoint).sqrMagnitude;
+
+                if (sqrDist < maxSqrRadius && sqrDist < minSqrDist)
+                {
+                    minSqrDist = sqrDist;
+                    markerIndex = i;
+                }
+            }
+            return markerIndex != -1;
+        }
+
+        public void BeginDrag(int markerIndex)
+        {
+            if (markerIndex < 0 || markerIndex >= markers.Count || markers[markerIndex] == null) return;
+            
+            // Un-anchor the marker during drag
+            ARAnchor anchor = markers[markerIndex].GetComponentInParent<ARAnchor>();
+            if (anchor != null)
+            {
+                if (anchor.gameObject != markers[markerIndex])
+                {
+                    if (ARManager.Instance != null && ARManager.Instance.Origin != null)
+                        markers[markerIndex].transform.SetParent(ARManager.Instance.Origin.TrackablesParent, true);
+                    else
+                        markers[markerIndex].transform.SetParent(null, true);
+                    
+                    Destroy(anchor.gameObject);
+                }
+                else
+                {
+                    Destroy(anchor);
+                }
             }
 
-            lastTapTime =
-                Time.unscaledTime;
+            Color orange = new Color(1.0f, 0.5f, 0.0f, 1.0f); // ORANGE
+            foreach (GameObject m in markers)
+            {
+                if (m == null) continue;
+                MeshRenderer renderer = m.GetComponent<MeshRenderer>();
+                if (renderer != null)
+                {
+                    renderer.material.color = orange;
+                }
+            }
 
-            Debug.Log(
-                "[MeasurementManager] Screen tap: " +
-                touch.position
-            );
+            if (lineRenderer != null)
+            {
+                lineRenderer.startColor = orange;
+                lineRenderer.endColor = orange;
+                if (lineRenderer.material != null)
+                {
+                    lineRenderer.material.color = orange;
+                }
+            }
+            
+            Debug.Log($"[MeasurementManager] Begin Drag Marker {markerIndex}. Entire measurement colored Orange.");
+        }
 
-            TryMeasureAtScreenPoint(
-                touch.position
-            );
+        public void UpdateDrag(int markerIndex, Vector2 screenPos)
+        {
+            if (markerIndex < 0 || markerIndex >= markers.Count || markers[markerIndex] == null) return;
+
+            if (ARManager.Instance != null && ARManager.Instance.PerformRaycast(screenPos, out Pose hitPose, out ARPlane hitPlane))
+            {
+                measurementPoints[markerIndex] = hitPose.position;
+                markers[markerIndex].transform.position = hitPose.position;
+                
+                UpdateMeasurementVisuals();
+                CalculateMeasurement();
+            }
+        }
+
+        public void EndDrag(int markerIndex)
+        {
+            if (markerIndex < 0 || markerIndex >= markers.Count || markers[markerIndex] == null) return;
+            
+            Color effectiveColor = AppSettings.Instance != null ? AppSettings.Instance.ThemeColor : markerColor;
+            foreach (GameObject m in markers)
+            {
+                if (m == null) continue;
+                MeshRenderer renderer = m.GetComponent<MeshRenderer>();
+                if (renderer != null)
+                {
+                    renderer.material.color = effectiveColor;
+                }
+            }
+
+            if (lineRenderer != null)
+            {
+                lineRenderer.startColor = effectiveColor;
+                lineRenderer.endColor = effectiveColor;
+                if (lineRenderer.material != null)
+                {
+                    lineRenderer.material.color = effectiveColor;
+                }
+            }
+
+            // Re-anchor at the new position
+            if (ARManager.Instance != null && ARManager.Instance.PerformRaycast(ARManager.Instance.ARCamera.WorldToScreenPoint(markers[markerIndex].transform.position), out Pose hitPose, out ARPlane hitPlane))
+            {
+                if (ARManager.Instance.AnchorManager != null && ARManager.Instance.AnchorManager.enabled)
+                {
+                    ARAnchor anchor = null;
+                    if (hitPlane != null)
+                    {
+                        anchor = ARManager.Instance.AnchorManager.AttachAnchor(hitPlane, hitPose);
+                    }
+
+                    if (anchor == null)
+                    {
+                        GameObject anchorObj = new GameObject("Anchor_" + markerIndex);
+                        if (ARManager.Instance.Origin != null && ARManager.Instance.Origin.TrackablesParent != null)
+                        {
+                            anchorObj.transform.SetParent(ARManager.Instance.Origin.TrackablesParent, false);
+                        }
+                        anchorObj.transform.SetPositionAndRotation(hitPose.position, hitPose.rotation);
+                        anchor = anchorObj.AddComponent<ARAnchor>();
+                    }
+
+                    if (anchor != null)
+                    {
+                        markers[markerIndex].transform.SetParent(anchor.transform, false);
+                        markers[markerIndex].transform.localPosition = Vector3.zero;
+                        markers[markerIndex].transform.localRotation = Quaternion.identity;
+                        
+                        Vector3 parentScale = anchor.transform.lossyScale;
+                        markers[markerIndex].transform.localScale = new Vector3(
+                            parentScale.x > 1e-4f ? markerSize / parentScale.x : markerSize,
+                            parentScale.y > 1e-4f ? markerSize / parentScale.y : markerSize,
+                            parentScale.z > 1e-4f ? markerSize / parentScale.z : markerSize
+                        );
+                    }
+                }
+            }
+
+            Debug.Log($"[MeasurementManager] End Drag Marker {markerIndex}. Anchored at new location.");
         }
 
         // =========================================================
         // SCREEN -> AR SURFACE
         // =========================================================
 
-        private void TryMeasureAtScreenPoint(
+        public void TryMeasureAtScreenPoint(
             Vector2 screenPoint)
         {
             if (EventSystem.current != null)
@@ -455,6 +609,15 @@ namespace SmartARMeasure.Core
                     Debug.Log($"[MeasurementManager] Tap at {screenPoint} blocked by UI: {results[0].gameObject.name}");
                     return;
                 }
+            }
+
+            if (ARManager.Instance != null)
+            {
+                if (ARManager.Instance.PerformRaycast(screenPoint, out Pose hitPose, out ARPlane hitPlane))
+                {
+                    AddMeasurementPoint(hitPose, hitPlane);
+                }
+                return;
             }
 
             ResolveARReferences();
@@ -502,23 +665,12 @@ namespace SmartARMeasure.Core
                 return;
             }
 
-            Pose hitPose =
+            Pose fallbackPose =
                 raycastHits[0].pose;
 
-            Vector3 worldPoint =
-                hitPose.position;
-
-            // Lift the visual measurement above the plane.
-            worldPoint +=
-                hitPose.up * surfaceOffset;
-
-            Debug.Log(
-                "[MeasurementManager] AR HIT: " +
-                worldPoint
-            );
-
             AddMeasurementPoint(
-                worldPoint
+                fallbackPose,
+                raycastHits[0].trackable as ARPlane
             );
         }
 
@@ -574,6 +726,8 @@ namespace SmartARMeasure.Core
             // measurement.
             // -----------------------------------------------------
 
+            Pose effectivePose = hitPose;
+
             if (currentMode ==
                 MeasurementMode.Height)
             {
@@ -581,7 +735,7 @@ namespace SmartARMeasure.Core
                 {
                     Debug.Log(
                         "[MeasurementManager] " +
-                        "Height already has 2 points. " +
+                        "Height mode already has 2 points. " +
                         "Ignoring additional tap."
                     );
 
@@ -594,7 +748,7 @@ namespace SmartARMeasure.Core
             // -----------------------------------------------------
 
             measurementPoints.Add(
-                hitPose.position
+                effectivePose.position
             );
 
             // -----------------------------------------------------
@@ -602,7 +756,7 @@ namespace SmartARMeasure.Core
             // -----------------------------------------------------
 
             CreateMarker(
-                hitPose,
+                effectivePose,
                 hitPlane
             );
 
@@ -625,6 +779,14 @@ namespace SmartARMeasure.Core
                     SmartARMeasure.UI.NotificationToastController.Instance?.ShowToast(
                         "Please mark points around the boundary in sequence."
                     );
+                }
+            }
+
+            if (measurementPoints.Count >= 2)
+            {
+                if (SmartARMeasure.UI.AROverlayUIController.Instance != null)
+                {
+                    SmartARMeasure.UI.AROverlayUIController.Instance.ShowCustomHint("Tap a marker to move it", 10.0f);
                 }
             }
 
@@ -786,14 +948,23 @@ namespace SmartARMeasure.Core
                 );
             }
 
-            // Remove matching blue marker.
+            // Remove matching blue marker and its anchor.
             if (markers.Count > 0)
             {
                 GameObject marker =
                     markers[markers.Count - 1];
 
                 if (marker != null)
-                    Destroy(marker);
+                {
+                    if (marker.transform.parent != null && marker.transform.parent.GetComponent<ARAnchor>() != null)
+                    {
+                        Destroy(marker.transform.parent.gameObject);
+                    }
+                    else
+                    {
+                        Destroy(marker);
+                    }
+                }
 
                 markers.RemoveAt(
                     markers.Count - 1
@@ -837,11 +1008,12 @@ namespace SmartARMeasure.Core
 
                 case MeasurementMode.Height:
 
-                    currentValue =
-                        Mathf.Abs(
-                            measurementPoints[1].y -
-                            measurementPoints[0].y
-                        );
+                    Vector3 worldUp = (ARManager.Instance != null && ARManager.Instance.Origin != null)
+                        ? ARManager.Instance.Origin.transform.up
+                        : Vector3.up;
+                    Vector3 delta = measurementPoints[1] - measurementPoints[0];
+                    currentValue = Mathf.Abs(Vector3.Dot(delta, worldUp));
+                    Debug.Log($"[MeasurementManager] HEIGHT CALCULATION: Point A={measurementPoints[0]}, Point B={measurementPoints[1]}, Delta={delta}, WorldUp={worldUp}, Height={currentValue:F4}m");
 
                     break;
 
@@ -1155,9 +1327,73 @@ namespace SmartARMeasure.Core
                 new GameObject("MeasurementMarker_" + markers.Count);
 
             marker.layer = 0; // Default layer
-            marker.transform.SetPositionAndRotation(hitPose.position, hitPose.rotation);
             marker.transform.localScale = Vector3.one * markerSize;
-            marker.transform.SetParent(null, true);
+
+            // -----------------------------------------------------
+            // ATTACH TO REAL PERSISTENT AR TRACKING ANCHOR
+            // -----------------------------------------------------
+            ARAnchor anchor = null;
+            if (ARManager.Instance != null && ARManager.Instance.AnchorManager != null && ARManager.Instance.AnchorManager.enabled)
+            {
+                if (hitPlane != null)
+                {
+                    anchor = ARManager.Instance.AnchorManager.AttachAnchor(hitPlane, hitPose);
+                }
+
+                if (anchor == null)
+                {
+                    GameObject anchorObj = new GameObject("Anchor_" + markers.Count);
+                    if (ARManager.Instance.Origin != null && ARManager.Instance.Origin.TrackablesParent != null)
+                    {
+                        anchorObj.transform.SetParent(ARManager.Instance.Origin.TrackablesParent, false);
+                    }
+                    anchorObj.transform.SetPositionAndRotation(hitPose.position, hitPose.rotation);
+                    anchor = anchorObj.AddComponent<ARAnchor>();
+                }
+            }
+
+            if (anchor != null)
+            {
+                marker.transform.SetParent(anchor.transform, false);
+                marker.transform.localPosition = Vector3.zero;
+                marker.transform.localRotation = Quaternion.identity;
+
+                // Compensate for parent lossy scale so marker physical size is strictly markerSize in world space
+                Vector3 parentScale = anchor.transform.lossyScale;
+                marker.transform.localScale = new Vector3(
+                    parentScale.x > 1e-4f ? markerSize / parentScale.x : markerSize,
+                    parentScale.y > 1e-4f ? markerSize / parentScale.y : markerSize,
+                    parentScale.z > 1e-4f ? markerSize / parentScale.z : markerSize
+                );
+
+                Debug.Log($"[MeasurementManager] Marker attached to persistent ARAnchor: {anchor.name} (Plane: {(hitPlane != null ? hitPlane.trackableId.ToString() : "free-anchor")})");
+            }
+            else
+            {
+                marker.transform.SetPositionAndRotation(hitPose.position, hitPose.rotation);
+                if (ARManager.Instance != null && ARManager.Instance.Origin != null && ARManager.Instance.Origin.TrackablesParent != null)
+                {
+                    marker.transform.SetParent(ARManager.Instance.Origin.TrackablesParent, true);
+                }
+                else
+                {
+                    marker.transform.SetParent(null, true);
+                }
+
+                if (marker.transform.parent != null)
+                {
+                    Vector3 parentScale = marker.transform.parent.lossyScale;
+                    marker.transform.localScale = new Vector3(
+                        parentScale.x > 1e-4f ? markerSize / parentScale.x : markerSize,
+                        parentScale.y > 1e-4f ? markerSize / parentScale.y : markerSize,
+                        parentScale.z > 1e-4f ? markerSize / parentScale.z : markerSize
+                    );
+                }
+                else
+                {
+                    marker.transform.localScale = Vector3.one * markerSize;
+                }
+            }
 
             MeshFilter filter = marker.AddComponent<MeshFilter>();
             filter.sharedMesh = GetOrCreateSphereMesh();
@@ -1415,17 +1651,18 @@ namespace SmartARMeasure.Core
 
         private void DestroyVisuals()
         {
-            for (
-                int i = 0;
-                i < markers.Count;
-                i++
-            )
+            for (int i = 0; i < markers.Count; i++)
             {
                 if (markers[i] != null)
                 {
-                    Destroy(
-                        markers[i]
-                    );
+                    if (markers[i].transform.parent != null && markers[i].transform.parent.GetComponent<ARAnchor>() != null)
+                    {
+                        Destroy(markers[i].transform.parent.gameObject);
+                    }
+                    else
+                    {
+                        Destroy(markers[i]);
+                    }
                 }
             }
 

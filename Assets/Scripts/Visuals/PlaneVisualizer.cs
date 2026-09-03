@@ -8,9 +8,10 @@ namespace SmartARMeasure.Visuals
 {
     /// <summary>
     /// Professional AR surface visualization controller attached to ARPlane prefabs.
-    /// Implements subtle translucent ash gray surface rendering with fine dot distribution,
-    /// dynamic fade-in on detection/expansion, and smooth fade-down once the surface is established.
-    /// Responds immediately to AppSettings.ShowPlanes without interrupting AR tracking.
+    /// Implements reference-style subtle ash-gray translucent surface with tiny white dots,
+    /// dynamic fade-in on detection/expansion, hold during scanning/refinement, and smooth fade-out.
+    /// Re-appears naturally when the user moves into newly scanned areas or expands plane boundaries.
+    /// Operates purely visually; AR tracking and raycasting measurements remain uninterrupted.
     /// </summary>
     [RequireComponent(typeof(ARPlane))]
     [RequireComponent(typeof(MeshFilter))]
@@ -25,13 +26,15 @@ namespace SmartARMeasure.Visuals
             FadingOut
         }
 
-        // Timing constants for smooth scanning feedback
-        private const float FADE_IN_DURATION = 0.35f;   // Smooth appearance when newly detected
-        private const float HOLD_DURATION = 2.0f;       // Visible while detecting/refining
-        private const float FADE_OUT_DURATION = 1.2f;   // Graceful fade down once established
-        private const float MIN_UPDATE_INTERVAL = 0.15f; // Debounce rapid boundary updates
+        // Timing constants for scanning feedback
+        private const float FADE_IN_DURATION = 0.35f;    // Smooth appearance when newly detected/expanded
+        private const float HOLD_DURATION = 2.0f;        // Visible during detection/refinement
+        private const float FADE_OUT_DURATION = 1.0f;    // Graceful fade down once surface is established
+        private const float MIN_SIZE_CHANGE_RETRIGGER = 0.12f; // Retrigger if plane expands by > 12cm
+        private const float RETRIGGER_COOLDOWN = 1.2f;   // Cooldown between movement/expansion retriggers
 
         private ARPlane arPlane;
+        private MeshFilter meshFilter;
         private MeshRenderer meshRenderer;
         private MaterialPropertyBlock propertyBlock;
         private static readonly int AlphaPropId = Shader.PropertyToID("_AlphaMultiplier");
@@ -39,12 +42,14 @@ namespace SmartARMeasure.Visuals
         private VisualState currentState = VisualState.Hidden;
         private float currentAlpha = 0f;
         private float holdTimer = 0f;
-        private float lastBoundaryUpdateTime = 0f;
+        private float lastTriggerTime = 0f;
+        private Vector2 lastTriggerSize = Vector2.zero;
         private bool isSubscribed = false;
 
         private void Awake()
         {
             arPlane = GetComponent<ARPlane>();
+            meshFilter = GetComponent<MeshFilter>();
             meshRenderer = GetComponent<MeshRenderer>();
             propertyBlock = new MaterialPropertyBlock();
 
@@ -67,6 +72,7 @@ namespace SmartARMeasure.Visuals
 
         private void Start()
         {
+            EnsureMaterialAssigned();
             ApplyInitialVisibility();
         }
 
@@ -104,10 +110,14 @@ namespace SmartARMeasure.Visuals
             isSubscribed = false;
         }
 
-        private void EnsureMaterialAssigned()
+        public void EnsureMaterialAssigned()
         {
+            if (meshRenderer == null)
+                meshRenderer = GetComponent<MeshRenderer>();
+
             if (meshRenderer == null) return;
 
+            // Ensure custom ARSurfaceDots shader is used
             if (meshRenderer.sharedMaterial == null || !meshRenderer.sharedMaterial.shader.name.Contains("ARSurfaceDots"))
             {
                 Shader dotShader = Shader.Find("SmartARMeasure/ARSurfaceDots");
@@ -140,8 +150,8 @@ namespace SmartARMeasure.Visuals
             }
             else
             {
-                // Newly detected plane - smoothly fade in
-                TriggerDetection();
+                // Trigger smooth scanning fade-in for newly detected plane
+                TriggerScanFeedback(true);
             }
         }
 
@@ -156,33 +166,38 @@ namespace SmartARMeasure.Visuals
             }
             else
             {
-                TriggerDetection();
+                TriggerScanFeedback(true);
             }
         }
 
         private void OnBoundaryChanged(ARPlaneBoundaryChangedEventArgs args)
         {
-            // Debounce boundary updates to avoid unnecessary per-frame restarts
-            if (Time.time - lastBoundaryUpdateTime < MIN_UPDATE_INTERVAL)
+            bool showPlanes = AppSettings.Instance != null ? AppSettings.Instance.ShowPlanes : AppSettings.DEFAULT_SHOW_PLANES;
+            if (!showPlanes || arPlane == null) return;
+
+            Vector2 currentSize = arPlane.size;
+            float sizeDelta = Vector2.Distance(currentSize, lastTriggerSize);
+            float timeSinceLast = Time.time - lastTriggerTime;
+
+            // If plane is currently holding or fading in, refresh hold timer during continuous scanning
+            if (currentState == VisualState.Holding || currentState == VisualState.FadingIn)
             {
-                // Refresh hold timer without interrupting ongoing fade
                 holdTimer = HOLD_DURATION;
+                lastTriggerSize = currentSize;
                 return;
             }
 
-            lastBoundaryUpdateTime = Time.time;
-
-            bool showPlanes = AppSettings.Instance != null ? AppSettings.Instance.ShowPlanes : AppSettings.DEFAULT_SHOW_PLANES;
-            if (showPlanes)
+            // If plane has finished fading or is hidden, retrigger if the user moved and expanded the plane
+            if (sizeDelta >= MIN_SIZE_CHANGE_RETRIGGER || timeSinceLast >= RETRIGGER_COOLDOWN)
             {
-                TriggerDetection();
+                TriggerScanFeedback(false);
             }
         }
 
         /// <summary>
-        /// Triggers or refreshes the surface detection visualization cycle.
+        /// Triggers or refreshes the temporary scanning surface visualization cycle.
         /// </summary>
-        public void TriggerDetection()
+        public void TriggerScanFeedback(bool forceImmediate)
         {
             bool showPlanes = AppSettings.Instance != null ? AppSettings.Instance.ShowPlanes : AppSettings.DEFAULT_SHOW_PLANES;
             if (!showPlanes) return;
@@ -193,10 +208,14 @@ namespace SmartARMeasure.Visuals
             }
 
             holdTimer = HOLD_DURATION;
+            lastTriggerTime = Time.time;
+            if (arPlane != null)
+            {
+                lastTriggerSize = arPlane.size;
+            }
 
             if (currentState == VisualState.Holding || currentState == VisualState.FadingIn)
             {
-                // Already visible, continue holding
                 return;
             }
 
@@ -220,6 +239,11 @@ namespace SmartARMeasure.Visuals
             switch (currentState)
             {
                 case VisualState.FadingIn:
+                    if (meshRenderer != null && !meshRenderer.enabled)
+                    {
+                        meshRenderer.enabled = true;
+                    }
+
                     currentAlpha += dt / FADE_IN_DURATION;
                     if (currentAlpha >= 1.0f)
                     {
@@ -252,7 +276,7 @@ namespace SmartARMeasure.Visuals
                     break;
 
                 case VisualState.Hidden:
-                    // Dormant until a new boundary expansion or re-scan triggers TriggerDetection
+                    // Dormant until a new boundary expansion or re-scan triggers TriggerScanFeedback
                     break;
             }
         }

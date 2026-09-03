@@ -65,6 +65,42 @@ namespace SmartARMeasure.Core
         private GameObject reticleObject;
 
         // ============================================================
+        // GESTURE & PINCH ZOOM STATE
+        // ============================================================
+
+        private enum GestureState
+        {
+            None,
+            PossibleTap,
+            PinchZoom,
+            PinchLockedEnding,
+            DragIgnored,
+            MarkerDragging
+        }
+
+        [Header("Pinch Zoom Settings")]
+        [SerializeField] private float minZoom = 1.0f;
+        [SerializeField] private float maxZoom = 3.5f;
+        [SerializeField] private float zoomSensitivity = 0.0035f;
+        [SerializeField] private float zoomSmoothing = 15f;
+
+        private GestureState currentGestureState = GestureState.None;
+        private Vector2 tapStartPosition;
+        private float tapStartTime;
+        private int tapFingerId = -1;
+        private float lastPinchDistance = 0f;
+        private const float MAX_TAP_MOVEMENT = 30f; // Max pixel drift allowed for stationary tap
+        private const float MAX_TAP_DURATION = 0.55f; // Max duration (seconds) for tap gesture
+        
+        private int draggedMarkerIndex = -1;
+
+        private float targetZoom = 1.0f;
+        private float currentZoom = 1.0f;
+        private Matrix4x4 baseProjMatrix = Matrix4x4.identity;
+        private float baseFOV = 60f;
+        private bool hasBaseProjection = false;
+
+        // ============================================================
         // RAYCAST
         // ============================================================
 
@@ -125,7 +161,7 @@ namespace SmartARMeasure.Core
             currentState;
 
         // ============================================================
-        // AWAKE
+        // AWAKE & START
         // ============================================================
 
         private void Awake()
@@ -144,6 +180,32 @@ namespace SmartARMeasure.Core
 
             Debug.Log(
                 "[ARManager] Awake - initialized.");
+        }
+
+        private void Start()
+        {
+            LogDiagnostics();
+        }
+
+        private void LogDiagnostics()
+        {
+            Debug.Log("==================== [AR FOUNDATION DIAGNOSTICS] ====================");
+            Debug.Log($"* AR Session found: {(arSession != null ? "YES" : "NO")}");
+            Debug.Log($"* AR Session running: {(arSession != null && arSession.enabled ? "YES" : "NO")}");
+            Debug.Log($"* Tracking state: {ARSession.state}");
+            Debug.Log($"* ARPlaneManager found: {(planeManager != null ? "YES" : "NO")}");
+            if (planeManager != null)
+            {
+                Debug.Log($"* Enabled: {planeManager.enabled}");
+                Debug.Log($"* Plane Detection Mode: {planeManager.requestedDetectionMode}");
+                Debug.Log($"* Plane Prefab assigned: {(planeManager.planePrefab != null ? "YES" : "NO")}");
+                Debug.Log($"* Tracked Plane Count: {planeManager.trackables.count}");
+            }
+            if (AppSettings.Instance != null)
+            {
+                Debug.Log($"* Show Surfaces setting: {(AppSettings.Instance.ShowPlanes ? "ON" : "OFF")}");
+            }
+            Debug.Log("=====================================================================");
         }
 
         // ============================================================
@@ -219,48 +281,331 @@ namespace SmartARMeasure.Core
         }
 
         // ============================================================
-        // UPDATE
+        // UPDATE & LATE UPDATE
         // ============================================================
 
         private void Update()
         {
+            UpdateCameraZoom();
             HandleTouchInput();
         }
 
+        private void LateUpdate()
+        {
+            UpdateCameraZoom();
+        }
+
         // ============================================================
-        // TOUCH INPUT
+        // PINCH ZOOM CAMERA & BACKGROUND VIDEO SMOOTHING
+        // ============================================================
+
+        private static readonly int UnityDisplayTransformPropId = Shader.PropertyToID("_UnityDisplayTransform");
+        private static readonly int DisplayTransformPropId = Shader.PropertyToID("_DisplayTransform");
+        private static readonly int TransformMatrixPropId = Shader.PropertyToID("_TransformMatrix");
+        private static readonly int TextureTransformPropId = Shader.PropertyToID("_TextureTransform");
+
+        private Matrix4x4 baseDisplayMatrix = Matrix4x4.identity;
+        private bool hasBaseDisplayMatrix = false;
+        private Matrix4x4 baseBgTransformMatrix = Matrix4x4.identity;
+        private bool hasBaseBgTransform = false;
+
+        private void UpdateCameraZoom()
+        {
+            currentZoom = Mathf.Lerp(currentZoom, targetZoom, Time.unscaledDeltaTime * zoomSmoothing);
+
+            Camera cam = ARCamera != null ? ARCamera : Camera.main;
+            if (cam == null) return;
+
+            ApplyCameraZoom(cam);
+        }
+
+        public void ApplyCameraZoom(Camera cam)
+        {
+            if (cam == null) return;
+
+            if (!hasBaseProjection)
+            {
+                baseProjMatrix = cam.projectionMatrix;
+                baseFOV = cam.fieldOfView > 0f ? cam.fieldOfView : 60f;
+                hasBaseProjection = true;
+            }
+
+            // 1. ZOOM 3D VIRTUAL WORLD PROJECTION
+            if (Mathf.Abs(currentZoom - 1.0f) > 0.001f)
+            {
+                Matrix4x4 zoomedProj = baseProjMatrix;
+                zoomedProj[0, 0] *= currentZoom;
+                zoomedProj[1, 1] *= currentZoom;
+                // DO NOT multiply [0,2] and [1,2] (principal point). This causes marker drift!
+                cam.projectionMatrix = zoomedProj;
+                cam.fieldOfView = baseFOV / currentZoom;
+            }
+            else
+            {
+                if (hasBaseProjection)
+                {
+                    cam.projectionMatrix = baseProjMatrix;
+                    cam.fieldOfView = baseFOV;
+                }
+            }
+
+            // 2. ZOOM REAL CAMERA VIDEO FEED (ARCameraBackground)
+            if (cameraBackground != null)
+            {
+                Material bgMat = cameraBackground.material;
+                if (bgMat != null)
+                {
+                    float invZ = 1.0f / currentZoom;
+                    float offset = 0.5f * (1.0f - invZ);
+
+                    // Row-vector affine center-scaling matrix:
+                    // In GLSL row-major: vec4(u, v, 1, 0) * (scaleMatrix * baseDisplayMatrix)
+                    // = (vec4(u, v, 1, 0) * scaleMatrix) * baseDisplayMatrix
+                    // where vec4(u, v, 1, 0) * scaleMatrix = [0.5 + (u-0.5)/z, 0.5 + (v-0.5)/z, 1, 0]
+                    Matrix4x4 scaleMatrix = Matrix4x4.identity;
+                    scaleMatrix.m00 = invZ;
+                    scaleMatrix.m11 = invZ;
+                    scaleMatrix.m20 = offset; // Row 2, Col 0
+                    scaleMatrix.m21 = offset; // Row 2, Col 1
+
+                    // Apply to _UnityDisplayTransform (Official AR Foundation background property)
+                    bool appliedDisplayTransform = false;
+                    if (hasBaseDisplayMatrix)
+                    {
+                        Matrix4x4 zoomedDisplayMatrix = scaleMatrix * baseDisplayMatrix;
+                        bgMat.SetMatrix(UnityDisplayTransformPropId, zoomedDisplayMatrix);
+                        if (bgMat.HasProperty(DisplayTransformPropId))
+                            bgMat.SetMatrix(DisplayTransformPropId, zoomedDisplayMatrix);
+                        appliedDisplayTransform = true;
+                    }
+                    else if (bgMat.HasProperty(UnityDisplayTransformPropId))
+                    {
+                        Matrix4x4 cur = bgMat.GetMatrix(UnityDisplayTransformPropId);
+                        bgMat.SetMatrix(UnityDisplayTransformPropId, scaleMatrix * cur);
+                        appliedDisplayTransform = true;
+                    }
+
+                    if (bgMat.HasProperty(TransformMatrixPropId))
+                    {
+                        if (!hasBaseBgTransform || Mathf.Abs(currentZoom - 1.0f) < 0.001f)
+                        {
+                            baseBgTransformMatrix = bgMat.GetMatrix(TransformMatrixPropId);
+                            hasBaseBgTransform = true;
+                        }
+
+                        if (Mathf.Abs(currentZoom - 1.0f) > 0.001f)
+                        {
+                            bgMat.SetMatrix(TransformMatrixPropId, scaleMatrix * baseBgTransformMatrix);
+                        }
+                        else if (hasBaseBgTransform)
+                        {
+                            bgMat.SetMatrix(TransformMatrixPropId, baseBgTransformMatrix);
+                        }
+                        appliedDisplayTransform = true;
+                    }
+
+                    // Only fallback to _MainTex if shader does not use display transform properties
+                    if (!appliedDisplayTransform && bgMat.HasProperty("_MainTex"))
+                    {
+                        if (Mathf.Abs(currentZoom - 1.0f) > 0.001f)
+                        {
+                            bgMat.SetTextureScale("_MainTex", new Vector2(invZ, invZ));
+                            bgMat.SetTextureOffset("_MainTex", new Vector2(offset, offset));
+                        }
+                        else
+                        {
+                            bgMat.SetTextureScale("_MainTex", Vector2.one);
+                            bgMat.SetTextureOffset("_MainTex", Vector2.zero);
+                        }
+                    }
+                    else if (appliedDisplayTransform && bgMat.HasProperty("_MainTex"))
+                    {
+                        // Reset _MainTex scale to (1,1) so it doesn't double-scale with _UnityDisplayTransform
+                        bgMat.SetTextureScale("_MainTex", Vector2.one);
+                        bgMat.SetTextureOffset("_MainTex", Vector2.zero);
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // COORDINATED GESTURE & TOUCH INPUT
         // ============================================================
 
         private void HandleTouchInput()
         {
             var touches =
                 UnityEngine.InputSystem.EnhancedTouch.Touch.activeTouches;
+            int touchCount = touches.Count;
 
-            if (touches.Count == 0)
-                return;
-
-            // --------------------------------------------------------
-            // ONLY PROCESS A NEW TAP
-            // --------------------------------------------------------
-
-            foreach (var touch in touches)
+            if (touchCount == 0)
             {
-                if (touch.phase !=
-                    UnityEngine.InputSystem.TouchPhase.Began)
+                // When all fingers leave the screen, reset gesture state
+                if (currentGestureState == GestureState.PinchLockedEnding ||
+                    currentGestureState == GestureState.DragIgnored ||
+                    currentGestureState == GestureState.PossibleTap)
                 {
-                    continue;
+                    currentGestureState = GestureState.None;
+                }
+                else if (currentGestureState == GestureState.MarkerDragging)
+                {
+                    if (MeasurementManager.Instance != null)
+                    {
+                        MeasurementManager.Instance.EndDrag(draggedMarkerIndex);
+                    }
+                    currentGestureState = GestureState.None;
+                    draggedMarkerIndex = -1;
+                }
+                lastPinchDistance = 0f;
+                return;
+            }
+
+            // --------------------------------------------------------
+            // 1. PINCH ZOOM DETECTION (2 or more active touches)
+            // --------------------------------------------------------
+            if (touchCount >= 2)
+            {
+                var touch0 = touches[0];
+                var touch1 = touches[1];
+
+                // If touch sequence originated over UI, ignore to protect UI elements
+                if (currentGestureState == GestureState.None || currentGestureState == GestureState.PossibleTap || currentGestureState == GestureState.MarkerDragging)
+                {
+                    if (IsPointerOverUI(touch0.screenPosition, touch0.finger.index) ||
+                        IsPointerOverUI(touch1.screenPosition, touch1.finger.index))
+                    {
+                        currentGestureState = GestureState.DragIgnored;
+                        return;
+                    }
                 }
 
-                Vector2 screenPosition =
-                    touch.screenPosition;
+                // Immediately cancel any pending tap or long-press and enter PinchZoom
+                currentGestureState = GestureState.PinchZoom;
+                tapFingerId = -1;
+                draggedMarkerIndex = -1;
 
-                Debug.Log(
-                    "[ARManager] TOUCH BEGAN -> " +
-                    screenPosition);
+                float currentPinchDist = Vector2.Distance(touch0.screenPosition, touch1.screenPosition);
 
-                HandleScreenTap(
-                    screenPosition,
-                    touch.finger.index);
+                // If newly entering pinch, initialize distance
+                if (touch0.phase == UnityEngine.InputSystem.TouchPhase.Began ||
+                    touch1.phase == UnityEngine.InputSystem.TouchPhase.Began ||
+                    lastPinchDistance <= 0.01f)
+                {
+                    lastPinchDistance = currentPinchDist;
+                }
+                else
+                {
+                    float delta = currentPinchDist - lastPinchDistance;
+                    lastPinchDistance = currentPinchDist;
+
+                    // Apply zoom delta
+                    targetZoom = Mathf.Clamp(targetZoom + delta * zoomSensitivity, minZoom, maxZoom);
+                }
+
+                // Raycast/marker placement is 100% blocked during pinch
+                return;
+            }
+
+            // --------------------------------------------------------
+            // 2. PINCH LOCKED TRANSITION (Dropped from 2+ fingers to 1)
+            // --------------------------------------------------------
+            if (currentGestureState == GestureState.PinchZoom || currentGestureState == GestureState.PinchLockedEnding)
+            {
+                // One finger still on screen from previous pinch.
+                // Lock it so it CANNOT be converted into an accidental tap when lifted.
+                currentGestureState = GestureState.PinchLockedEnding;
+                lastPinchDistance = 0f;
+                return;
+            }
+
+            // --------------------------------------------------------
+            // 3. SINGLE TOUCH PROCESSING (Exactly 1 active touch)
+            // --------------------------------------------------------
+            var singleTouch = touches[0];
+            Vector2 currentPos = singleTouch.screenPosition;
+            int fingerId = singleTouch.finger.index;
+
+            switch (singleTouch.phase)
+            {
+                case UnityEngine.InputSystem.TouchPhase.Began:
+                    // Check UI blocking first
+                    if (IsPointerOverUI(currentPos, fingerId))
+                    {
+                        currentGestureState = GestureState.DragIgnored;
+                        return;
+                    }
+
+                    // Check if touching an existing marker
+                    if (MeasurementManager.Instance != null && MeasurementManager.Instance.GetMarkerAtScreenPoint(currentPos, out int mIndex))
+                    {
+                        currentGestureState = GestureState.MarkerDragging;
+                        draggedMarkerIndex = mIndex;
+                        tapStartPosition = currentPos;
+                        tapStartTime = Time.unscaledTime;
+                        tapFingerId = fingerId;
+                        if (MeasurementManager.Instance != null)
+                        {
+                            MeasurementManager.Instance.BeginDrag(draggedMarkerIndex);
+                        }
+                        return;
+                    }
+
+                    // Start possible tap tracking
+                    currentGestureState = GestureState.PossibleTap;
+                    tapStartPosition = currentPos;
+                    tapStartTime = Time.unscaledTime;
+                    tapFingerId = fingerId;
+                    break;
+
+                case UnityEngine.InputSystem.TouchPhase.Moved:
+                case UnityEngine.InputSystem.TouchPhase.Stationary:
+                    float duration = Time.unscaledTime - tapStartTime;
+                    float movedDist = Vector2.Distance(currentPos, tapStartPosition);
+
+                    if (currentGestureState == GestureState.PossibleTap)
+                    {
+                        if (movedDist > MAX_TAP_MOVEMENT)
+                        {
+                            // Finger moved too far -> convert to DragIgnored (no tap)
+                            currentGestureState = GestureState.DragIgnored;
+                        }
+                    }
+                    else if (currentGestureState == GestureState.MarkerDragging)
+                    {
+                        // Freely dragging the marker
+                        if (MeasurementManager.Instance != null)
+                        {
+                            MeasurementManager.Instance.UpdateDrag(draggedMarkerIndex, currentPos);
+                        }
+                    }
+                    break;
+
+                case UnityEngine.InputSystem.TouchPhase.Ended:
+                case UnityEngine.InputSystem.TouchPhase.Canceled:
+                    if (currentGestureState == GestureState.PossibleTap && singleTouch.phase == UnityEngine.InputSystem.TouchPhase.Ended && fingerId == tapFingerId)
+                    {
+                        float tapDur = Time.unscaledTime - tapStartTime;
+                        float tapDist = Vector2.Distance(currentPos, tapStartPosition);
+
+                        if (tapDur <= MAX_TAP_DURATION && tapDist <= MAX_TAP_MOVEMENT)
+                        {
+                            // Confirmed genuine single tap!
+                            Debug.Log($"[ARManager] Confirmed Single Tap at {tapStartPosition} (Duration: {tapDur:F2}s, Movement: {tapDist:F1}px, Zoom: {currentZoom:F2}x)");
+                            HandleScreenTap(tapStartPosition, fingerId);
+                        }
+                    }
+                    else if (currentGestureState == GestureState.MarkerDragging)
+                    {
+                        if (MeasurementManager.Instance != null)
+                        {
+                            MeasurementManager.Instance.EndDrag(draggedMarkerIndex);
+                        }
+                    }
+
+                    currentGestureState = GestureState.None;
+                    tapFingerId = -1;
+                    draggedMarkerIndex = -1;
+                    break;
             }
         }
 
@@ -414,6 +759,42 @@ namespace SmartARMeasure.Core
                 "[ARManager] SCREEN POSITION ERROR = " +
                 screenError);
 
+            Vector2 viewportPos = cam.ScreenToViewportPoint(screenPosition);
+            Vector3 planeNormal = hitPlane != null ? hitPlane.normal : Vector3.up;
+            string modeName = MeasurementManager.Instance != null ? MeasurementManager.Instance.CurrentMode.ToString() : "Unknown";
+
+            Debug.Log(
+                "--------------------------------\n" +
+                "MARKER DEBUG\n" +
+                "--------------------------------\n" +
+                $"Mode: {modeName}\n" +
+                $"Orientation: {Screen.orientation} ({Screen.width}x{Screen.height})\n" +
+                $"Zoom: {currentZoom:F2}x\n" +
+                $"Screen: ({screenPosition.x:F1}, {screenPosition.y:F1})\n" +
+                $"Viewport: ({viewportPos.x:F3}, {viewportPos.y:F3})\n" +
+                $"Ray Origin: {screenRay.origin}\n" +
+                $"Ray Direction: {screenRay.direction}\n" +
+                $"Raycast Hit: {worldPoint}\n" +
+                $"Trackable: {(hitPlane != null ? hitPlane.trackableId.ToString() : "None/FeaturePoint")}\n" +
+                $"Plane Normal: {planeNormal}\n" +
+                $"Anchor Position: {worldPoint}\n" +
+                $"Stored Measurement Position: {worldPoint}\n" +
+                "--------------------------------");
+
+            if (MeasurementManager.Instance != null && MeasurementManager.Instance.MeasurementPoints.Count >= 1)
+            {
+                Vector3 prevPoint = MeasurementManager.Instance.MeasurementPoints[MeasurementManager.Instance.MeasurementPoints.Count - 1];
+                Vector3 delta = worldPoint - prevPoint;
+                float distMeters = delta.magnitude;
+                Debug.Log(
+                    "--------------------------------\n" +
+                    $"DX: {delta.x:F4}m ({delta.x * 100f:F1}cm)\n" +
+                    $"DY: {delta.y:F4}m ({delta.y * 100f:F1}cm)\n" +
+                    $"DZ: {delta.z:F4}m ({delta.z * 100f:F1}cm)\n" +
+                    $"WORLD DISTANCE: {distMeters:F4}m ({distMeters * 100f:F2}cm)\n" +
+                    "--------------------------------");
+            }
+
             // --------------------------------------------------------
             // ADD MEASUREMENT POINT WITH NATIVE ARPLANE ANCHORING
             // --------------------------------------------------------
@@ -543,10 +924,30 @@ namespace SmartARMeasure.Core
                 if (planeManager.planePrefab == null)
                 {
                     GameObject template = new GameObject("ARPlaneTemplate", typeof(ARPlane), typeof(ARPlaneMeshVisualizer), typeof(MeshFilter), typeof(MeshRenderer), typeof(SmartARMeasure.Visuals.PlaneVisualizer));
+                    
+                    var mr = template.GetComponent<MeshRenderer>();
+                    if (mr != null)
+                    {
+                        Shader shader = Shader.Find("SmartARMeasure/ARSurfaceDots") 
+                                     ?? Shader.Find("Universal Render Pipeline/Unlit") 
+                                     ?? Shader.Find("Unlit/Transparent");
+
+                        if (shader != null)
+                        {
+                            Material mat = new Material(shader)
+                            {
+                                name = "M_ARSurfaceDots_Template"
+                            };
+
+                            mr.sharedMaterial = mat;
+                            mr.enabled = true;
+                        }
+                    }
+
                     template.transform.SetParent(transform);
                     template.SetActive(false);
                     planeManager.planePrefab = template;
-                    Debug.Log("[ARManager] Successfully initialized ARPlaneManager planePrefab template.");
+                    Debug.Log("[ARManager] Successfully initialized ARPlaneManager planePrefab template with ARSurfaceDots material.");
                 }
             }
             else
@@ -682,6 +1083,16 @@ namespace SmartARMeasure.Core
             ARCameraFrameEventArgs args)
         {
             hasReceivedFrame = true;
+            if (args.displayMatrix.HasValue)
+            {
+                baseDisplayMatrix = args.displayMatrix.Value;
+                hasBaseDisplayMatrix = true;
+            }
+            if (args.projectionMatrix.HasValue)
+            {
+                baseProjMatrix = args.projectionMatrix.Value;
+                hasBaseProjection = true;
+            }
         }
 
         // ============================================================
@@ -699,12 +1110,9 @@ namespace SmartARMeasure.Core
             if (raycastManager == null)
             {
                 ValidateComponents();
-
                 if (raycastManager == null)
                 {
-                    Debug.LogError(
-                        "[ARManager] ARRaycastManager is missing.");
-
+                    Debug.LogError("[ARManager] ARRaycastManager is missing.");
                     return false;
                 }
             }
@@ -712,135 +1120,237 @@ namespace SmartARMeasure.Core
             if (!raycastManager.enabled)
             {
                 raycastManager.enabled = true;
-
-                Debug.Log(
-                    "[ARManager] RaycastManager re-enabled.");
+                Debug.Log("[ARManager] RaycastManager re-enabled.");
             }
+
+            Camera cam = ARCamera != null ? ARCamera : Camera.main;
+            if (cam == null)
+            {
+                Debug.LogError("[ARManager] Camera is missing for raycast.");
+                return false;
+            }
+
+            // 1. CALCULATE UNZOOMED SCREEN COORDINATE
+            Vector2 screenCenter = cam.pixelRect.center;
+            Vector2 unzoomedScreenPos = screenPosition;
+            if (currentZoom > 1.001f)
+            {
+                unzoomedScreenPos = screenCenter + (screenPosition - screenCenter) / currentZoom;
+            }
+
+            Debug.Log($"[ARManager] RAYCAST PIPELINE -> Touch: {screenPosition}, Unzoomed: {unzoomedScreenPos}, Zoom: {currentZoom:F2}x");
 
             s_Hits.Clear();
 
             // --------------------------------------------------------
-            // FIRST: REAL TRACKED PLANES (EXACT WITHIN POLYGON)
+            // PASS 1: GATHER ALL NATIVE HITS
             // --------------------------------------------------------
-
-            bool hit =
-                raycastManager.Raycast(
-                    screenPosition,
-                    s_Hits,
-                    TrackableType.PlaneWithinPolygon);
-
-            if (hit && s_Hits.Count > 0)
+            
+            s_Hits.Clear();
+            List<ARRaycastHit> polygonHits = new List<ARRaycastHit>();
+            if (raycastManager.Raycast(unzoomedScreenPos, s_Hits, TrackableType.PlaneWithinPolygon))
             {
-                hitPose =
-                    s_Hits[0].pose;
-
-                hitPlane =
-                    s_Hits[0].trackable as ARPlane;
-
-                lastHitPose =
-                    hitPose;
-
-                hasValidHitPose =
-                    true;
-
-                OnReticleUpdated?.Invoke(
-                    hitPose,
-                    true);
-
-                Debug.Log(
-                    "[ARManager] EXACT SURFACE HIT -> " +
-                    hitPose.position + (hitPlane != null ? $" (Plane: {hitPlane.trackableId})" : ""));
-
-                return true;
+                polygonHits.AddRange(s_Hits);
             }
-
-            // --------------------------------------------------------
-            // SECOND: ESTIMATED PLANE FALLBACK
-            // --------------------------------------------------------
 
             s_Hits.Clear();
-
-            hit =
-                raycastManager.Raycast(
-                    screenPosition,
-                    s_Hits,
-                    TrackableType.PlaneEstimated | TrackableType.PlaneWithinBounds);
-
-            if (hit && s_Hits.Count > 0)
+            List<ARRaycastHit> boundsHits = new List<ARRaycastHit>();
+            if (raycastManager.Raycast(unzoomedScreenPos, s_Hits, TrackableType.PlaneWithinBounds | TrackableType.PlaneEstimated))
             {
-                hitPose =
-                    s_Hits[0].pose;
-
-                hitPlane =
-                    s_Hits[0].trackable as ARPlane;
-
-                lastHitPose =
-                    hitPose;
-
-                hasValidHitPose =
-                    true;
-
-                OnReticleUpdated?.Invoke(
-                    hitPose,
-                    true);
-
-                Debug.Log(
-                    "[ARManager] ESTIMATED SURFACE HIT -> " +
-                    hitPose.position);
-
-                return true;
+                boundsHits.AddRange(s_Hits);
             }
-
-            // --------------------------------------------------------
-            // THIRD: FEATURE POINT FALLBACK
-            // --------------------------------------------------------
 
             s_Hits.Clear();
-
-            hit =
-                raycastManager.Raycast(
-                    screenPosition,
-                    s_Hits,
-                    TrackableType.FeaturePoint);
-
-            if (hit && s_Hits.Count > 0)
+            List<ARRaycastHit> featureHits = new List<ARRaycastHit>();
+            if (raycastManager.Raycast(unzoomedScreenPos, s_Hits, TrackableType.FeaturePoint))
             {
-                hitPose =
-                    s_Hits[0].pose;
-
-                hitPlane = null;
-
-                lastHitPose =
-                    hitPose;
-
-                hasValidHitPose =
-                    true;
-
-                OnReticleUpdated?.Invoke(
-                    hitPose,
-                    true);
-
-                Debug.Log(
-                    "[ARManager] FEATURE POINT HIT -> " +
-                    hitPose.position);
-
-                return true;
+                featureHits.AddRange(s_Hits);
             }
 
             // --------------------------------------------------------
-            // NO HIT
+            // PASS 2: DEPTH-AWARE PRIORITY EVALUATION
             // --------------------------------------------------------
+            ARRaycastHit bestHit = default;
+            bool foundHit = false;
+            TrackableType selectedType = TrackableType.None;
+
+            if (polygonHits.Count > 0)
+            {
+                bestHit = polygonHits[0];
+                foundHit = true;
+                selectedType = TrackableType.PlaneWithinPolygon;
+                
+                float polygonDist = bestHit.distance > 0f ? bestHit.distance : Vector3.Distance(cam.transform.position, bestHit.pose.position);
+
+                // Check if a FeaturePoint or Bounds hit is significantly closer (Foreground Object Graze)
+                float minForegroundDist = polygonDist;
+                ARRaycastHit foregroundHit = default;
+                bool hasForeground = false;
+                TrackableType fgType = TrackableType.None;
+
+                foreach (var fh in featureHits)
+                {
+                    float dist = fh.distance > 0f ? fh.distance : Vector3.Distance(cam.transform.position, fh.pose.position);
+                    if (dist < minForegroundDist - 0.10f) // Must be > 10cm closer to camera
+                    {
+                        minForegroundDist = dist;
+                        foregroundHit = fh;
+                        hasForeground = true;
+                        fgType = TrackableType.FeaturePoint;
+                    }
+                }
+
+                foreach (var bh in boundsHits)
+                {
+                    float dist = bh.distance > 0f ? bh.distance : Vector3.Distance(cam.transform.position, bh.pose.position);
+                    if (dist < minForegroundDist - 0.10f) // Must be > 10cm closer to camera
+                    {
+                        minForegroundDist = dist;
+                        foregroundHit = bh;
+                        hasForeground = true;
+                        fgType = bh.hitType;
+                    }
+                }
+
+                if (hasForeground)
+                {
+                    bestHit = foregroundHit;
+                    selectedType = fgType;
+                    Debug.Log($"[ARManager] FOREGROUND GRAZE DETECTED! Polygon plane was at {polygonDist:F2}m, but Foreground ({fgType}) hit was at {minForegroundDist:F2}m. Selecting foreground.");
+                }
+            }
+            else if (boundsHits.Count > 0)
+            {
+                bestHit = boundsHits[0];
+                foundHit = true;
+                selectedType = bestHit.hitType;
+            }
+            else if (featureHits.Count > 0)
+            {
+                bestHit = featureHits[0];
+                foundHit = true;
+                selectedType = TrackableType.FeaturePoint;
+            }
+
+            // --------------------------------------------------------
+            // PASS 3: FINALIZE
+            // --------------------------------------------------------
+            if (foundHit)
+            {
+                hitPose = bestHit.pose;
+                hitPlane = bestHit.trackable as ARPlane;
+                lastHitPose = hitPose;
+                hasValidHitPose = true;
+
+                OnReticleUpdated?.Invoke(hitPose, true);
+                Debug.Log($"[ARManager] DEPTH-AWARE SURFACE HIT ({selectedType}) -> Pos: {hitPose.position}" + (hitPlane != null ? $" (Plane: {hitPlane.trackableId})" : ""));
+                return true;
+            }
 
             hasValidHitPose = false;
-
-            OnReticleUpdated?.Invoke(
-                Pose.identity,
-                false);
-
-            Debug.Log(
-                "[ARManager] Raycast returned NO HIT.");
-
+            OnReticleUpdated?.Invoke(Pose.identity, false);
+            Debug.Log("[ARManager] Raycast returned NO HIT.");
             return false;
+        }
+
+        /// <summary>
+        /// Geometrically refines a surface hit against the physical plane's boundary polygon vertices and edge segments.
+        /// When the user taps near a table edge/corner (< 6 cm), snaps to the boundary edge or corner in 3D world space.
+        /// Leaves hits on open surfaces untouched to maintain exact linear accuracy.
+        /// </summary>
+        public static Pose RefineHitPoseNearPlaneBoundary(Pose hitPose, ARPlane plane, float maxSnapDistance = 0.06f)
+        {
+            if (plane == null) return hitPose;
+
+            var boundary = plane.boundary;
+            if (!boundary.IsCreated || boundary.Length < 3) return hitPose;
+
+            Vector3 worldHit = hitPose.position;
+            Vector3 localHit = plane.transform.InverseTransformPoint(worldHit);
+            Vector2 localHit2D = new Vector2(localHit.x, localHit.z);
+
+            float closestEdgeDist = float.MaxValue;
+            Vector2 closestEdgePoint2D = localHit2D;
+            int closestVertexIndex = -1;
+            float closestVertexDist = float.MaxValue;
+
+            int n = boundary.Length;
+            for (int i = 0; i < n; i++)
+            {
+                Vector2 v0 = boundary[i];
+                Vector2 v1 = boundary[(i + 1) % n];
+
+                float vDist = Vector2.Distance(localHit2D, v0);
+                if (vDist < closestVertexDist)
+                {
+                    closestVertexDist = vDist;
+                    closestVertexIndex = i;
+                }
+
+                Vector2 segPoint = ClosestPointOnSegment2D(localHit2D, v0, v1);
+                float segDist = Vector2.Distance(localHit2D, segPoint);
+                if (segDist < closestEdgeDist)
+                {
+                    closestEdgeDist = segDist;
+                    closestEdgePoint2D = segPoint;
+                }
+            }
+
+            Vector3 planeScale = plane.transform.lossyScale;
+            float scaleFactor = Mathf.Max(planeScale.x, planeScale.z);
+            if (scaleFactor <= 1e-4f) scaleFactor = 1f;
+
+            float worldEdgeDist = closestEdgeDist * scaleFactor;
+            float worldVertexDist = closestVertexDist * scaleFactor;
+
+            // Strict confidence threshold: snap only when user tap was within maxSnapDistance of detected boundary
+            if (worldEdgeDist <= maxSnapDistance)
+            {
+                Vector2 targetLocal2D;
+                if (worldVertexDist <= 0.04f && closestVertexIndex >= 0)
+                {
+                    targetLocal2D = boundary[closestVertexIndex];
+                    Debug.Log($"[ARManager] CORNER REFINEMENT -> Vertex {closestVertexIndex}, Dist: {worldVertexDist * 100f:F1}cm");
+                }
+                else
+                {
+                    targetLocal2D = closestEdgePoint2D;
+                    Debug.Log($"[ARManager] EDGE REFINEMENT -> Edge Dist: {worldEdgeDist * 100f:F1}cm");
+                }
+
+                Vector3 refinedLocal = new Vector3(targetLocal2D.x, localHit.y, targetLocal2D.y);
+                Vector3 refinedWorld = plane.transform.TransformPoint(refinedLocal);
+
+                return new Pose(refinedWorld, hitPose.rotation);
+            }
+
+            return hitPose;
+        }
+
+        private static Vector2 ClosestPointOnSegment2D(Vector2 p, Vector2 a, Vector2 b)
+        {
+            Vector2 ab = b - a;
+            float sqrLen = ab.sqrMagnitude;
+            if (sqrLen < 1e-6f) return a;
+            float t = Mathf.Clamp01(Vector2.Dot(p - a, ab) / sqrLen);
+            return a + t * ab;
+        }
+
+        private static ARRaycastHit GetClosestHit(List<ARRaycastHit> hits)
+        {
+            if (hits == null || hits.Count == 0) return default;
+            ARRaycastHit closest = hits[0];
+            float minDist = closest.distance;
+
+            for (int i = 1; i < hits.Count; i++)
+            {
+                if (hits[i].distance > 0f && (minDist <= 0f || hits[i].distance < minDist))
+                {
+                    minDist = hits[i].distance;
+                    closest = hits[i];
+                }
+            }
+            return closest;
         }
 
         public bool PerformRaycast(
@@ -951,6 +1461,69 @@ namespace SmartARMeasure.Core
             if (planeManager == null)
                 return;
 
+            foreach (var plane in args.added)
+            {
+                if (plane != null)
+                {
+                    // Ensure the instantiated plane GameObject is active
+                    if (!plane.gameObject.activeSelf)
+                    {
+                        plane.gameObject.SetActive(true);
+                    }
+
+                    var visualizer = plane.GetComponent<SmartARMeasure.Visuals.PlaneVisualizer>();
+                    if (visualizer == null)
+                    {
+                        visualizer = plane.gameObject.AddComponent<SmartARMeasure.Visuals.PlaneVisualizer>();
+                    }
+                    visualizer.EnsureMaterialAssigned();
+
+                    var mr = plane.GetComponent<MeshRenderer>();
+                    var mf = plane.GetComponent<MeshFilter>();
+                    int vCount = (mf != null && mf.sharedMesh != null) ? mf.sharedMesh.vertexCount : 0;
+                    int tCount = (mf != null && mf.sharedMesh != null && mf.sharedMesh.triangles != null) ? mf.sharedMesh.triangles.Length / 3 : 0;
+                    string sName = (mr != null && mr.sharedMaterial != null && mr.sharedMaterial.shader != null) ? mr.sharedMaterial.shader.name : "NONE";
+
+                    Debug.Log($"[ARManager] >>> AR PLANE ADDED <<<\n" +
+                              $"* ID: {plane.trackableId}\n" +
+                              $"* Tracking State: {plane.trackingState}\n" +
+                              $"* Alignment: {plane.alignment}\n" +
+                              $"* Size: {plane.size}\n" +
+                              $"* Mesh Vertices: {vCount}\n" +
+                              $"* Mesh Triangles: {tCount}\n" +
+                              $"* MeshRenderer Enabled: {(mr != null && mr.enabled)}\n" +
+                              $"* Material Assigned: {(mr != null && mr.sharedMaterial != null)}\n" +
+                              $"* Shader: {sName}\n" +
+                              $"* GameObject Active: {plane.gameObject.activeInHierarchy}");
+                }
+            }
+
+            foreach (var plane in args.updated)
+            {
+                if (plane != null)
+                {
+                    var mr = plane.GetComponent<MeshRenderer>();
+                    var mf = plane.GetComponent<MeshFilter>();
+                    int vCount = (mf != null && mf.sharedMesh != null) ? mf.sharedMesh.vertexCount : 0;
+                    int tCount = (mf != null && mf.sharedMesh != null && mf.sharedMesh.triangles != null) ? mf.sharedMesh.triangles.Length / 3 : 0;
+
+                    Debug.Log($"[ARManager] >>> AR PLANE UPDATED <<<\n" +
+                              $"* ID: {plane.trackableId}\n" +
+                              $"* Tracking State: {plane.trackingState}\n" +
+                              $"* Mesh Vertices: {vCount}\n" +
+                              $"* Mesh Triangles: {tCount}\n" +
+                              $"* MeshRenderer Enabled: {(mr != null && mr.enabled)}");
+                }
+            }
+
+            foreach (var plane in args.removed)
+            {
+                if (plane != null)
+                {
+                    Debug.Log($"[ARManager] >>> AR PLANE REMOVED <<< ID: {plane.trackableId}");
+                }
+            }
+
             if (planeManager.trackables.count > 0)
             {
                 if (currentState ==
@@ -960,7 +1533,7 @@ namespace SmartARMeasure.Core
                         ARTrackingState.TrackingActive);
 
                     Debug.Log(
-                        "[ARManager] AR PLANE DETECTED.");
+                        "[ARManager] AR PLANE DETECTED. Active tracked planes: " + planeManager.trackables.count);
                 }
             }
         }

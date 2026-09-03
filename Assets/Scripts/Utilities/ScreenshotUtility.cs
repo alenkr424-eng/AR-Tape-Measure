@@ -61,23 +61,72 @@ namespace SmartARMeasure.Utilities
             byte[] bytes = UnityEngine.ImageConversion.EncodeToPNG(screenshot);
             Destroy(screenshot);
 
-            string folder = Path.Combine(Application.persistentDataPath, "Screenshots");
-            if (!Directory.Exists(folder))
+            bool success = false;
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+            try
             {
-                Directory.CreateDirectory(folder);
+                using (AndroidJavaClass environment = new AndroidJavaClass("android.os.Environment"))
+                using (AndroidJavaObject externalStorageDir = environment.CallStatic<AndroidJavaObject>("getExternalStoragePublicDirectory", environment.GetStatic<string>("DIRECTORY_PICTURES")))
+                {
+                    string picturesPath = externalStorageDir.Call<string>("getAbsolutePath");
+                    string appDir = Path.Combine(picturesPath, "SmartARMeasure");
+                    if (!Directory.Exists(appDir)) Directory.CreateDirectory(appDir);
+                    
+                    string filename = $"SmartAR_Capture_{DateTime.Now:yyyyMMdd_HHmmss}.png";
+                    string filePath = Path.Combine(appDir, filename);
+                    File.WriteAllBytes(filePath, bytes);
+
+                    using (AndroidJavaClass unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+                    using (AndroidJavaObject currentActivity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity"))
+                    using (AndroidJavaClass mediaScanner = new AndroidJavaClass("android.media.MediaScannerConnection"))
+                    {
+                        mediaScanner.CallStatic("scanFile", currentActivity, new string[] { filePath }, new string[] { "image/png" }, null);
+                    }
+                    
+                    Debug.Log($"Screenshot successfully saved to gallery at: {filePath}");
+                    success = true;
+                    OnScreenshotCaptured?.Invoke(filePath);
+                }
             }
+            catch (System.Exception e)
+            {
+                Debug.LogError("Failed to save to gallery: " + e.Message);
+            }
+#else
+            // Fallback for Editor / iOS (if applicable)
+            try
+            {
+                string folder = Path.Combine(Application.persistentDataPath, "Screenshots");
+                if (!Directory.Exists(folder))
+                {
+                    Directory.CreateDirectory(folder);
+                }
 
-            string filename = $"SmartAR_Capture_{DateTime.Now:yyyyMMdd_HHmmss}.png";
-            string filePath = Path.Combine(folder, filename);
-            File.WriteAllBytes(filePath, bytes);
+                string filename = $"SmartAR_Capture_{DateTime.Now:yyyyMMdd_HHmmss}.png";
+                string filePath = Path.Combine(folder, filename);
+                File.WriteAllBytes(filePath, bytes);
 
-            Debug.Log($"Screenshot captured and saved to: {filePath}");
+                Debug.Log($"Screenshot captured and saved to internal storage: {filePath}");
+                success = true;
+                OnScreenshotCaptured?.Invoke(filePath);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError("Failed to save internally: " + e.Message);
+            }
+#endif
+
             HapticFeedback.TriggerMedium();
 
-            OnScreenshotCaptured?.Invoke(filePath);
-
-            // Share natively
-            ExportUtility.ShareFileNative(filePath, "image/png", "Share AR Measurement Screenshot");
+            if (success)
+            {
+                SmartARMeasure.UI.NotificationToastController.Instance?.ShowToast("Saved!", 5.0f);
+            }
+            else
+            {
+                SmartARMeasure.UI.NotificationToastController.Instance?.ShowToast("Save failed", 5.0f);
+            }
         }
     }
 }

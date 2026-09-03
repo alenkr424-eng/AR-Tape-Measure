@@ -42,17 +42,17 @@ namespace SmartARMeasure.UI
         /// <summary>
         /// Shows a temporary toast message banner.
         /// </summary>
-        public void ShowToast(string message)
+        public void ShowToast(string message, float? durationOverride = null)
         {
             if (activeToastCoroutine != null)
             {
                 StopCoroutine(activeToastCoroutine);
             }
 
-            activeToastCoroutine = StartCoroutine(ToastRoutine(message));
+            activeToastCoroutine = StartCoroutine(ToastRoutine(message, durationOverride ?? displayDuration));
         }
 
-        private IEnumerator ToastRoutine(string message)
+        private IEnumerator ToastRoutine(string message, float waitTime)
         {
             if (toastText != null)
             {
@@ -72,7 +72,7 @@ namespace SmartARMeasure.UI
                 toastCanvasGroup.alpha = 1f;
 
                 // Wait display duration
-                yield return new WaitForSeconds(displayDuration);
+                yield return new WaitForSeconds(waitTime);
 
                 // Fade out
                 elapsed = 0f;
